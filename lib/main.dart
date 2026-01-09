@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart'; // For MediaType
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -21,20 +22,25 @@ void main() {
 
 class PredictResult {
   final String? gradCamImage; // [0] Image Grad-CAM (URL ou Base64)
-  final String? segmentationImage; // [1] Image Segmentation (URL ou Base64)
-  final Map<String, dynamic>? resultJson; // [2] Résultats JSON
+  final String? segmentationUnetImage; // [1] Nouvelle: Masque U-Net (vert)
+  final String?
+  segmentationOpencvImage; // [2] Déplacé: Masque OpenCV (bleu/rouge)
   final String? reportMd; // [3] Markdown
-  final String? reportFile; // [4] Fichier
-  final String? extraMd; // [5] Extra Markdown
+  final Map<String, dynamic>? resultJson; // [4] Déplacé: Résultats JSON
+  final String? reportFile; // [5] Fichier
   final List<List<double>>? contours; // Contours parsed from resultJson
+
+  // Accessor pour compatibilité: préfère U-Net, sinon OpenCV
+  String? get segmentationImage =>
+      segmentationUnetImage ?? segmentationOpencvImage;
 
   PredictResult({
     this.gradCamImage,
-    this.segmentationImage,
+    this.segmentationUnetImage,
+    this.segmentationOpencvImage,
     this.resultJson,
     this.reportMd,
     this.reportFile,
-    this.extraMd,
     this.contours,
   });
 
@@ -110,35 +116,44 @@ class PredictResult {
       }
     }
 
-    // Helper to parse contours
+    // Helper to parse contours from new Ensemble structure
     List<List<double>>? parseContours(Map<String, dynamic>? json) {
-      if (json == null) {
-        debugPrint("parseContours: json is null");
-        return null;
+      if (json == null) return null;
+
+      var rawContours;
+
+      // 1. Try New Structure (Ensemble)
+      if (json.containsKey('segmentacion')) {
+        final seg = json['segmentacion'];
+        if (seg is Map) {
+          // Priority: U-Net
+          if (seg.containsKey('unet') &&
+              seg['unet'] is Map &&
+              seg['unet']['disponible'] == true &&
+              seg['unet']['contornos'] != null) {
+            debugPrint("parseContours: Using U-Net contours");
+            rawContours = seg['unet']['contornos'];
+          }
+          // Fallback: OpenCV
+          else if (seg.containsKey('opencv') &&
+              seg['opencv'] is Map &&
+              seg['opencv']['contornos'] != null) {
+            debugPrint("parseContours: Using OpenCV contours (fallback)");
+            rawContours = seg['opencv']['contornos'];
+          }
+        }
       }
 
-      debugPrint(
-        "parseContours: looking for 'contornos' in keys: ${json.keys.toList()}",
-      );
+      // 2. Legacy/Simple Structure
+      if (rawContours == null && json.containsKey('contornos')) {
+        rawContours = json['contornos'];
+      }
 
-      if (!json.containsKey('contornos')) {
-        debugPrint("parseContours: 'contornos' key not found");
+      if (rawContours == null || (rawContours is List && rawContours.isEmpty)) {
         return null;
       }
 
       try {
-        var rawContours = json['contornos'];
-        debugPrint(
-          "parseContours: rawContours type = ${rawContours.runtimeType}",
-        );
-        debugPrint("parseContours: rawContours = $rawContours");
-
-        if (rawContours == null ||
-            (rawContours is List && rawContours.isEmpty)) {
-          debugPrint("parseContours: contours is null or empty");
-          return null;
-        }
-
         // Handle deeply nested structure: [[[x,y], [x,y]...]] -> [[x,y], [x,y]...]
         if (rawContours is List && rawContours.isNotEmpty) {
           var unwrapped = rawContours;
@@ -154,8 +169,6 @@ class PredictResult {
         }
 
         final list = rawContours as List;
-        debugPrint("parseContours: parsing ${list.length} points");
-
         return list.map((point) {
           final coords = point as List;
           return [
@@ -170,17 +183,20 @@ class PredictResult {
     }
 
     final contours = parseContours(jsonMap);
-    debugPrint(
-      "parseContours: final contours = ${contours?.length ?? 0} points",
-    );
 
     return PredictResult(
       gradCamImage: asString(data.length > 0 ? data[0] : null),
-      segmentationImage: asString(data.length > 1 ? data[1] : null),
-      resultJson: jsonMap,
-      reportMd: asString(data.length > 3 ? data[3] : null),
-      reportFile: asString(data.length > 4 ? data[4] : null),
-      extraMd: asString(data.length > 5 ? data[5] : null),
+      segmentationUnetImage: asString(
+        data.length > 1 ? data[1] : null,
+      ), // Index 1: U-Net Mask (Green)
+      segmentationOpencvImage: asString(
+        data.length > 2 ? data[2] : null,
+      ), // Index 2: OpenCV Mask (Blue/Red)
+      resultJson: jsonMap, // Index 4: Full JSON
+      reportMd: asString(data.length > 3 ? data[3] : null), // Index 3: Markdown
+      reportFile: asString(
+        data.length > 5 ? data[5] : null,
+      ), // Index 5: Report File
       contours: contours,
     );
   }
@@ -195,12 +211,54 @@ class MelanomaService {
       'https://oscar2525mv-melanoma.hf.space/gradio_api';
   static const String _predictEndpoint = '$_baseUrl/call/predict_ui';
 
-  /// Convertit un fichier image en Base64
-  static Future<String> convertImageToBase64(File imageFile) async {
+  /// Upload image to Gradio and get file path
+  static Future<String> uploadImage(File imageFile) async {
     final bytes = await imageFile.readAsBytes();
-    final base64String = base64Encode(bytes);
-    // Gradio attend souvent une data URL complète
-    return 'data:image/jpeg;base64,$base64String';
+    final fileName = imageFile.path.split('/').last.split('\\').last;
+
+    // Determine MIME type
+    String mimeType = 'image/jpeg';
+    final lowerName = fileName.toLowerCase();
+    if (lowerName.endsWith('.png')) {
+      mimeType = 'image/png';
+    } else if (lowerName.endsWith('.webp')) {
+      mimeType = 'image/webp';
+    }
+
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('$_baseUrl/upload'),
+    );
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        'files',
+        bytes,
+        filename: fileName,
+        contentType: MediaType.parse(mimeType),
+      ),
+    );
+
+    final streamedResponse = await request.send().timeout(
+      const Duration(seconds: 60), // Increased for cold start
+    );
+    final response = await http.Response.fromStream(streamedResponse);
+
+    debugPrint("Upload Response Status: ${response.statusCode}");
+    debugPrint("Upload Response Body: ${response.body}");
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Erreur upload: ${response.statusCode} - ${response.body}',
+      );
+    }
+
+    final List<dynamic> uploadResult = jsonDecode(response.body);
+    if (uploadResult.isEmpty) {
+      throw Exception('Upload returned empty result');
+    }
+
+    // Returns the file path on the server
+    return uploadResult[0] as String;
   }
 
   /// Appelle l'API Gradio et attend le résultat
@@ -210,25 +268,34 @@ class MelanomaService {
     required String mode,
     String? notes,
   }) async {
-    // 1. Préparer l'image
-    final String imageBase64 = await convertImageToBase64(imageFile);
+    // 1. Upload image first (méthode officielle Gradio)
+    final String uploadedPath = await uploadImage(imageFile);
+    debugPrint("Image uploaded to path: $uploadedPath");
 
-    // 2. Préparer le payload (4 paramètres: image, threshold, mode, notes)
+    // 2. Préparer le payload avec le path uploadé
+    // IMPORTANT: Gradio 4.x format for file input
+    debugPrint("=== DEBUG PAYLOAD ===");
+    debugPrint("Mode envoyé: '$mode'");
+    debugPrint("Threshold: $threshold");
+    debugPrint("Notes: '${notes ?? ""}'");
+
     final Map<String, dynamic> payload = {
       "data": [
+        // Image input - format Gradio 4.x
         {
-          "path": null,
-          "url": imageBase64,
-          "orig_name": "image.jpg",
-          "size": imageFile.lengthSync(),
-          "mime_type": "image/jpeg",
-          "meta": {"_type": "gradio.FileData"},
+          "path": uploadedPath,
+          "url": null,
+          "size": null,
+          "orig_name": imageFile.path.split('/').last.split('\\').last,
+          "mime_type": null,
         },
-        threshold,
-        mode,
-        notes ?? "",
+        threshold, // Slider value
+        mode, // Radio value (exact string match required)
+        notes ?? "", // Textbox value
       ],
     };
+
+    debugPrint("Payload JSON: ${jsonEncode(payload)}");
 
     // 3. Envoyer la requête POST initiale (Call)
     final postResponse = await http
@@ -237,29 +304,23 @@ class MelanomaService {
           headers: {"Content-Type": "application/json"},
           body: jsonEncode(payload),
         )
-        .timeout(const Duration(seconds: 30));
+        .timeout(const Duration(seconds: 60)); // Increased for cold start
+
+    debugPrint("POST Response Status: ${postResponse.statusCode}");
+    debugPrint("POST Response Body: ${postResponse.body}");
 
     if (postResponse.statusCode != 200) {
       throw Exception(
-        'Erreur POST: ${postResponse.statusCode} - ${postResponse.body}',
+        'Erreur POST (${postResponse.statusCode}): ${postResponse.body}',
       );
     }
 
     // 4. Récupérer l'EVENT_ID
-    // La réponse brute est: {"event_id": "..."}
     final postJson = jsonDecode(postResponse.body);
     final String eventId = postJson['event_id'];
     debugPrint("Analyse lancée. Event ID: $eventId");
 
-    // 5. Polling pour récupérer le résultat (GET)
-    // Gradio en mode SSE envoie des chunks: event: complete, data: [...]
-    // Nous utiliserons une requête simple GET N périodique si possible, ou stream
-    // Ici, implémentons un polling GET simple via http
-
-    // Note: L'endpoint pour lire l'event stream est /call/predict_ui/{event_id}
-    // C'est un Stream Server-Sent Events (SSE).
-    // Dart http Client.send permet de consommer le stream.
-
+    // 5. Lire le stream SSE pour les résultats
     final request = http.Request(
       'GET',
       Uri.parse('$_predictEndpoint/$eventId'),
@@ -268,10 +329,12 @@ class MelanomaService {
 
     final streamedResponse = await http.Client()
         .send(request)
-        .timeout(const Duration(seconds: 60));
+        .timeout(
+          const Duration(seconds: 300), // 5 min pour cold start + ensemble
+        );
 
     if (streamedResponse.statusCode != 200) {
-      throw Exception('Erreur Stream: ${streamedResponse.statusCode}');
+      throw Exception('Erreur Stream (${streamedResponse.statusCode})');
     }
 
     // Lire le flux ligne par ligne
@@ -279,41 +342,79 @@ class MelanomaService {
         .transform(utf8.decoder)
         .transform(const LineSplitter());
 
-    String? lastDataLine; // Guardar la última línea de datos para el error
+    List<String> allLines = [];
+    String? currentEvent;
 
     await for (String line in stream) {
-      debugPrint("SSE: $line"); // Log para depuración
+      debugPrint("SSE: $line");
+      allLines.add(line);
+
+      // Track event type
+      if (line.startsWith('event: ')) {
+        currentEvent = line.substring(7).trim();
+        debugPrint("Event type: $currentEvent");
+
+        // Handle error event
+        if (currentEvent == 'error') {
+          // Wait for the data line that should follow
+          continue;
+        }
+        continue;
+      }
 
       if (line.startsWith('data: ')) {
-        final dataStr = line.substring(6); // Retirer "data: "
-        lastDataLine = dataStr; // Guardar para mensajes de error
+        final dataStr = line.substring(6);
 
-        if (dataStr.contains('generating') || dataStr.contains('heartbeat'))
+        // Skip heartbeat/progress messages
+        if (dataStr.contains('"heartbeat"') ||
+            dataStr.contains('"generating"') ||
+            dataStr.contains('"progress"')) {
           continue;
+        }
+
+        // Handle error data
+        if (currentEvent == 'error') {
+          throw Exception('Erreur API Gradio: $dataStr');
+        }
 
         try {
-          // Si on reçoit l'erreur ici
           final decoded = jsonDecode(dataStr);
+
+          // Check for error in data
+          if (decoded is Map && decoded.containsKey('error')) {
+            throw Exception('Erreur API: ${decoded['error']}');
+          }
+
           if (decoded is List && decoded.isNotEmpty) {
-            // C'est probablement le résultat si c'est une liste
-            // Mais si c'est [null, null...] ou une erreur
-            if (decoded[0] == "error") {
-              throw Exception("Erreur API lue dans data: $decoded");
+            // Check if first element is error indicator
+            if (decoded[0] == "error" || decoded[0] == "__error__") {
+              throw Exception(
+                "Erreur API: ${decoded.length > 1 ? decoded[1] : decoded}",
+              );
             }
             debugPrint("Analyse terminée. Reçu ${decoded.length} éléments.");
             return PredictResult.fromList(decoded);
           }
-        } catch (_) {}
-      }
-
-      if (line.startsWith('event: error')) {
-        // Extraer el mensaje de error del último data recibido
-        String errorDetail = lastDataLine ?? "Sin detalles";
-        throw Exception("Error API Gradio: $errorDetail");
+        } catch (e) {
+          if (e.toString().contains('Erreur API') ||
+              e.toString().contains('Error')) {
+            rethrow;
+          }
+          // JSON parse error on intermediate message, continue
+          debugPrint("JSON parse non-fatal: $e");
+        }
       }
     }
 
-    throw Exception("Le flux s'est terminé sans résultat 'complete'.");
+    // Stream ended without result
+    final lastLines =
+        allLines.length > 10
+            ? allLines.sublist(allLines.length - 10)
+            : allLines;
+    throw Exception(
+      "Le flux SSE s'est terminé sans résultat valide.\n"
+      "Dernières lignes:\n${lastLines.join('\n')}",
+    );
   }
 }
 
@@ -370,17 +471,17 @@ class _MelanomaNativePageState extends State<MelanomaNativePage> {
   double _threshold = 0.5;
   final TextEditingController _notesController = TextEditingController();
 
-  // Options Mode (doivent correspondre EXACTEMENT à l'API)
+  // Options Mode (doivent correspondre EXACTEMENT à l'API Ensemble)
   final List<String> _modeOptions = [
-    'Rápido (Solo Local)',
-    'Preciso (Ensemble/Comité)',
+    'Rapide (Local seulement)',
+    'Précis (Ensemble/Comité)',
   ];
   late String _selectedMode;
 
   @override
   void initState() {
     super.initState();
-    _selectedMode = _modeOptions[0]; // Rápido par défaut
+    _selectedMode = _modeOptions[0]; // Rapide par défaut
     _requestPermissions();
   }
 
@@ -643,14 +744,14 @@ class _MelanomaNativePageState extends State<MelanomaNativePage> {
         SegmentedButton<String>(
           segments:
               _modeOptions.map((mode) {
-                final isRapido = mode.contains('Rápido');
+                final isRapide = mode.contains('Rapide');
                 return ButtonSegment(
                   value: mode,
                   label: Text(
-                    isRapido ? '⚡ Rapide' : '🧠 Précis',
+                    isRapide ? '⚡ Rapide' : '🧠 Précis',
                     style: const TextStyle(fontSize: 12),
                   ),
-                  icon: Icon(isRapido ? Icons.speed : Icons.psychology),
+                  icon: Icon(isRapide ? Icons.speed : Icons.psychology),
                 );
               }).toList(),
           selected: {_selectedMode},
@@ -663,7 +764,7 @@ class _MelanomaNativePageState extends State<MelanomaNativePage> {
         ),
         const SizedBox(height: 4),
         Text(
-          _selectedMode.contains('Rápido')
+          _selectedMode.contains('Rapide')
               ? 'Analyse rapide avec modèle local uniquement'
               : 'Analyse précise avec ensemble de modèles IA',
           style: TextStyle(fontSize: 11, color: Colors.grey.shade400),
@@ -710,25 +811,39 @@ class _MelanomaNativePageState extends State<MelanomaNativePage> {
 
     // Parsing du JSON con los nombres correctos de la API
     if (json != null) {
-      // prediccion_final
-      final pred =
-          (json['prediccion_final'] ?? json['prediccion'] ?? '')
-              .toString()
-              .toLowerCase();
-      if (pred.isNotEmpty) {
-        isMalignant =
-            pred.contains('malignant') ||
-            pred.contains('maligne') ||
-            pred.contains('melanoma');
-        diagnosis = isMalignant ? "Mélanome (Maligne)" : "Bénin";
-      }
-
-      // prob_malignidad (probabilidad de malignidad)
+      // 1. PRIMERO: Obtener prob_malignidad
       final confValue =
           json['prob_malignidad'] ?? json['prob_promedio'] ?? json['confianza'];
       if (confValue != null) {
-        confidence = double.tryParse(confValue.toString()) ?? 0.0;
+        double rawConf = double.tryParse(confValue.toString()) ?? 0.0;
+        // Si el valor es > 1, está en formato porcentaje (ej: 94.29), convertir a decimal
+        confidence = rawConf > 1.0 ? rawConf / 100.0 : rawConf;
       }
+
+      debugPrint("=== DIAGNOSTIC MALIGNANCY ===");
+      debugPrint("prob_malignidad raw: ${json['prob_malignidad']}");
+      debugPrint("prob_malignidad normalized (0-1): $confidence");
+
+      // 2. Intentar usar prediccion_final del API
+      final rawPred = json['prediccion_final'] ?? json['prediccion'] ?? '';
+      final pred = rawPred.toString().toLowerCase().trim();
+      debugPrint("prediccion_final: '$rawPred'");
+
+      if (pred.isNotEmpty && pred != 'null') {
+        // API devuelve "Malin" o "Bénin"
+        isMalignant =
+            pred.contains('malin') ||
+            pred.contains('malignant') ||
+            pred.contains('melanoma');
+        diagnosis = isMalignant ? "Mélanome (Maligne)" : "Bénin";
+        debugPrint("From prediccion_final -> isMalignant: $isMalignant");
+      } else {
+        // FALLBACK: usar prob_malignidad >= 0.5
+        isMalignant = confidence >= 0.5;
+        diagnosis = isMalignant ? "Mélanome (Maligne)" : "Bénin";
+        debugPrint("FALLBACK from prob >= 0.5 -> isMalignant: $isMalignant");
+      }
+      debugPrint("=== END: diagnosis=$diagnosis, isMalignant=$isMalignant ===");
     }
 
     return Column(
@@ -788,30 +903,36 @@ class _MelanomaNativePageState extends State<MelanomaNativePage> {
 
         const SizedBox(height: 24),
 
-        // 2. Images (Restored)
+        // 2. Images (Grad-CAM + Dual Segmentation)
         const Text(
           "Analyse Visuelle",
           style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 12),
+        // Row 1: Grad-CAM
+        if (res.gradCamImage != null)
+          _buildResultImage("Carte de Chaleur (Grad-CAM)", res.gradCamImage!),
+        const SizedBox(height: 12),
+        // Row 2: Dual Segmentation (U-Net + OpenCV si disponibles)
         Row(
           children: [
-            if (res.gradCamImage != null)
+            if (res.segmentationUnetImage != null)
               Expanded(
                 child: _buildResultImage(
-                  "Carte de Chaleur (Grad-CAM)",
-                  res.gradCamImage!,
+                  "Segmentation IA (U-Net)",
+                  res.segmentationUnetImage!,
                 ),
               ),
-            if (res.segmentationImage != null) ...[
+            if (res.segmentationUnetImage != null &&
+                res.segmentationOpencvImage != null)
               const SizedBox(width: 12),
+            if (res.segmentationOpencvImage != null)
               Expanded(
                 child: _buildResultImage(
-                  "Segmentation",
-                  res.segmentationImage!,
+                  "Segmentation Classique",
+                  res.segmentationOpencvImage!,
                 ),
               ),
-            ],
           ],
         ),
 
@@ -1000,17 +1121,17 @@ class _MelanomaNativePageState extends State<MelanomaNativePage> {
 
               const Divider(height: 32),
 
-              // Dimensions / Pixels (tamano de la API)
+              // Dimensions / Pixels - Lecture depuis segmentacion.unet ou opencv
               _buildInfoRow(
                 Icons.aspect_ratio,
                 "Surface (Pixels)",
-                "${res.resultJson?['tamano']?['area_px'] ?? 'N/A'}",
+                "${_getSegmentationValue(res.resultJson, 'area_px') ?? 'N/A'}",
               ),
               const SizedBox(height: 8),
               _buildInfoRow(
                 Icons.circle_outlined,
                 "Diamètre Équivalent",
-                "${res.resultJson?['tamano']?['diam_px']?.toStringAsFixed(1) ?? 'N/A'} px",
+                "${_getSegmentationValue(res.resultJson, 'diam_px')?.toStringAsFixed(1) ?? 'N/A'} px",
               ),
 
               // Markdown Report (Merged here)
@@ -1096,6 +1217,31 @@ class _MelanomaNativePageState extends State<MelanomaNativePage> {
         Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
       ],
     );
+  }
+
+  /// Helper pour lire les valeurs de segmentation depuis la nouvelle structure
+  /// Priorité: segmentacion.unet.tamano.[key] -> segmentacion.opencv.tamano.[key] -> tamano.[key] (legacy)
+  dynamic _getSegmentationValue(Map<String, dynamic>? json, String key) {
+    if (json == null) return null;
+
+    // 1. Essayer nouvelle structure Ensemble
+    if (json.containsKey('segmentacion')) {
+      final seg = json['segmentacion'];
+      if (seg is Map) {
+        // Priorité U-Net si disponible
+        if (seg['unet']?['disponible'] == true &&
+            seg['unet']?['tamano']?[key] != null) {
+          return seg['unet']['tamano'][key];
+        }
+        // Fallback OpenCV
+        if (seg['opencv']?['tamano']?[key] != null) {
+          return seg['opencv']['tamano'][key];
+        }
+      }
+    }
+
+    // 2. Legacy structure (tamano à la racine)
+    return json['tamano']?[key];
   }
 
   Widget _buildResultImage(String title, String src) {
